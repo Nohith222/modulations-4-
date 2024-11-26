@@ -1,0 +1,228 @@
+import tensorflow as tf
+from tensorflow.keras.applications import MobileNet
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from google.colab import drive
+
+# Mount Google Drive
+drive.mount('/content/drive')
+
+# Dataset path
+dataset_path = '/content/drive/MyDrive/modulation_dataset_1000images'
+
+# Data Augmentation with modified parameters
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    rotation_range=15,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    shear_range=0.1,
+    zoom_range=0.1,
+    horizontal_flip=True,
+    fill_mode='nearest'
+)
+
+test_val_datagen = ImageDataGenerator(rescale=1./255)
+
+train_generator = train_datagen.flow_from_directory(
+    directory=f'{dataset_path}/train',
+    target_size=(224, 224),
+    batch_size=10,
+    class_mode='categorical'
+)
+
+val_generator = test_val_datagen.flow_from_directory(
+    directory=f'{dataset_path}/validation',
+    target_size=(224, 224),
+    batch_size=10,
+    class_mode='categorical'
+)
+
+test_generator = test_val_datagen.flow_from_directory(
+    directory=f'{dataset_path}/test',
+    target_size=(224, 224),
+    batch_size=10,
+    class_mode='categorical',
+    shuffle=False
+)
+
+# Updated Model checkpoint and early stopping
+checkpoint = ModelCheckpoint('best_model_mobilenet.keras', monitor='val_accuracy', save_best_only=True, mode='max')
+early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3, min_lr=1e-5)
+
+# Transfer Learning with MobileNet
+base_model = MobileNet(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+x = base_model.output
+x = GlobalAveragePooling2D()(x)
+x = Dense(1024, activation='relu')(x)
+x = Dropout(0.3)(x)
+predictions = Dense(train_generator.num_classes, activation='softmax')(x)
+
+model = Model(inputs=base_model.input, outputs=predictions)
+
+# Freeze initial layers of MobileNet
+for layer in base_model.layers:
+    layer.trainable = False
+
+# Compile model
+model.compile(optimizer=tf.keras.optimizers.SGD(learning_rate=0.001, momentum=0.9),
+              loss='categorical_crossentropy',
+              metrics=['accuracy'])
+
+# Training phase 1
+history = model.fit(
+    train_generator,
+    epochs=12,
+    validation_data=val_generator,
+    callbacks=[checkpoint, early_stop, reduce_lr]
+)
+
+# Unfreeze some layers for fine-tuning
+for layer in base_model.layers[-4:]:
+    layer.trainable = True
+
+# Recompile with a lower learning rate for fine-tuning
+model.compile(optimizer=tf.keras.optimizers.SGD(learning_rate=0.0001, momentum=0.9),
+              loss='categorical_crossentropy',
+              metrics=['accuracy'])
+
+# Continue training with more epochs for fine-tuning
+fine_tune_epochs = 20
+total_epochs = 12 + fine_tune_epochs
+
+history_fine = model.fit(
+    train_generator,
+    epochs=total_epochs,
+    initial_epoch=history.epoch[-1],
+    validation_data=val_generator,
+    callbacks=[checkpoint, early_stop, reduce_lr]
+)
+
+# Load the best model
+model.load_weights('best_model_mobilenet.keras')
+
+# Evaluate the model on the test set
+test_loss, test_accuracy = model.evaluate(test_generator)
+print(f'Test Accuracy: {test_accuracy * 100:.2f}%')
+
+# Predict probabilities for test data
+Y_pred = model.predict(test_generator)
+y_pred = np.argmax(Y_pred, axis=1)
+
+# Confusion matrix
+cm = confusion_matrix(test_generator.classes, y_pred)
+target_names = list(train_generator.class_indices.keys())
+
+# Plotting functions remain unchanged
+def plot_confusion_matrix(cm, classes, title='Confusion Matrix', cmap=plt.cm.Blues):
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap=cmap, xticklabels=classes, yticklabels=classes)
+    plt.title(title)
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.show()
+
+# Plot confusion matrix
+plot_confusion_matrix(cm, target_names, title='Confusion Matrix')
+
+# Classification report
+print('Classification Report')
+print(classification_report(test_generator.classes, y_pred, target_names=target_names))
+
+# Individual class accuracies
+class_accuracies = cm.diagonal() / cm.sum(axis=1)
+for i, class_name in enumerate(target_names):
+    print(f"Accuracy for {class_name}: {class_accuracies[i] * 100:.2f}%")
+
+# Plot ROC-AUC curves for individual classes
+def plot_roc_curves(test_generator, Y_pred, num_classes):
+    fpr = {}
+    tpr = {}
+    roc_auc = {}
+    for i in range(num_classes):
+        fpr[i], tpr[i], _ = roc_curve(test_generator.classes == i, Y_pred[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+
+    plt.figure(figsize=(10, 8))
+    for i in range(num_classes):
+        plt.plot(fpr[i], tpr[i], label=f'Class {target_names[i]} (AUC = {roc_auc[i]:.2f})')
+
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curves')
+    plt.legend(loc='lower right')
+    plt.show()
+
+# Plot ROC-AUC curves
+plot_roc_curves(test_generator, Y_pred, num_classes=len(target_names))
+
+# Plot accuracy and loss curves
+plt.figure(figsize=(12, 6))
+
+# Plot accuracy
+plt.subplot(1, 2, 1)
+plt.plot(history.history['accuracy'] + history_fine.history['accuracy'], label='Training Accuracy')
+plt.plot(history.history['val_accuracy'] + history_fine.history['val_accuracy'], label='Validation Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend(loc='lower right')
+plt.title('Training and Validation Accuracy')
+
+# Plot loss
+plt.subplot(1, 2, 2)
+plt.plot(history.history['loss'] + history_fine.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'] + history_fine.history['val_loss'], label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend(loc='upper right')
+plt.title('Training and Validation Loss')
+
+plt.tight_layout()
+plt.show()
+
+
+# ... [rest of your existing code above]
+
+# Function to calculate and plot individual confusion matrix and accuracy for each modulation class
+def individual_confusion_matrices(cm, classes):
+    per_class_acc = cm.diagonal() / cm.sum(axis=1)
+
+    # Loop through each class to plot its individual confusion matrix and accuracy
+    for idx, label in enumerate(classes):
+        # Create a confusion matrix for this class vs. others
+        individual_cm = np.zeros((2, 2), dtype=int)
+        true_positives = cm[idx, idx]
+        false_positives = cm[:, idx].sum() - true_positives
+        false_negatives = cm[idx, :].sum() - true_positives
+        true_negatives = cm.sum() - (true_positives + false_positives + false_negatives)
+
+        individual_cm[0, 0] = true_positives      # True Positive
+        individual_cm[0, 1] = false_negatives     # False Negative
+        individual_cm[1, 0] = false_positives     # False Positive
+        individual_cm[1, 1] = true_negatives       # True Negative
+
+        # Plot individual confusion matrix
+        plt.figure(figsize=(6, 4))
+        sns.heatmap(individual_cm, annot=True, fmt="d", cmap="Blues",
+                    xticklabels=["Predicted " + label, "Predicted Not " + label],
+                    yticklabels=["Actual " + label, "Actual Not " + label])
+        plt.title(f'Confusion Matrix for {label}')
+        plt.xlabel('Predicted')
+        plt.ylabel('Actual')
+        plt.show()
+
+        # Print per-class accuracy
+        print(f"Accuracy for {label}: {per_class_acc[idx] * 100:.2f}%")
+
+# Call the function with the main confusion matrix and class names
+individual_confusion_matrices(cm, target_names)
